@@ -287,6 +287,15 @@ summarization_name_mapping = {
     "scicap_summary": ("paragraph", "caption_no_index"),
 }
 
+def set_test_label(data_args):
+    with open(data_args.test_file, 'r', encoding='utf-8') as f:
+        test_data = json.load(f)
+    '''add label'''
+    for i in range(len(test_data)):
+        test_data['annotations'][i]['caption'] = ""
+        test_data['annotations'][i]['caption_no_index'] = ""
+    print(test_data['annotations'][0])
+    return test_data
 
 def set_decoding_params(model):
 
@@ -296,6 +305,7 @@ def set_decoding_params(model):
     model.config.temperature = 0.8
     model.config.top_k = 100
     model.config.min_length = 0
+    print("model config:",model.config)
     return model
 
 def main():
@@ -369,16 +379,14 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
+    '''set temporary label for test dataset'''
+    test_data = set_test_label(data_args)
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     raw_datasets = load_dataset('json', data_files={
                             'train':data_args.train_file,
-                            'validation':data_args.validation_file,},
-                            field='annotations',
-                            cache_dir=model_args.cache_dir,
-                            use_auth_token=True if model_args.use_auth_token else None,)
-    test_datasets = load_dataset('json', data_files={
-                            'test':data_args.test_file},
+                            'validation':data_args.validation_file,
+                            'test':test_data},
                             field='annotations',
                             cache_dir=model_args.cache_dir,
                             use_auth_token=True if model_args.use_auth_token else None,)
@@ -448,6 +456,7 @@ def main():
             )
 
     prefix = data_args.source_prefix if data_args.source_prefix is not None else ""
+
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
     if training_args.do_train:
@@ -458,16 +467,14 @@ def main():
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         column_names = raw_datasets["validation"].column_names
-    else:
-        logger.info("There is nothing to do. Please pass `do_train`, `do_eval`.")
-        return
-    if training_args.do_predict:
-        if "test" not in test_datasets:
+    elif training_args.do_predict:
+        if "test" not in raw_datasets:
             raise ValueError("--do_predict requires a test dataset")
-        test_column_names = test_datasets["test"].column_names
-    # print(training_args.do_predict)
-    # print(test_column_names)
-    # exit()
+        column_names = raw_datasets["test"].column_names
+    else:
+        logger.info("There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`.")
+        return
+
     if isinstance(tokenizer, tuple(MULTILINGUAL_TOKENIZERS)):
         assert (
             data_args.lang is not None
@@ -514,14 +521,13 @@ def main():
 
     def preprocess_function(examples):
         # remove pairs where at least one record is None
+
         inputs, targets = [], []
         for i in range(len(examples[text_column])):
-            # use first paragraph as input only
-            inputs.append(examples[text_column][i][0])
-            if len(examples) == 6:
+            if examples[text_column][i] and examples[summary_column][i]:
+                # use first paragraph as input only
+                inputs.append(examples[text_column][i][0])
                 targets.append(examples[summary_column][i])
-            else:
-                targets.append(" ")
 
         inputs = [prefix + inp for inp in inputs]
         model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
@@ -572,8 +578,7 @@ def main():
 
     if training_args.do_predict:
         max_target_length = data_args.val_max_target_length
-        # predict_dataset = raw_datasets["test"]
-        predict_dataset = test_datasets["test"]
+        predict_dataset = raw_datasets["test"]
         if data_args.max_predict_samples is not None:
             max_predict_samples = min(len(predict_dataset), data_args.max_predict_samples)
             predict_dataset = predict_dataset.select(range(max_predict_samples))
@@ -582,7 +587,7 @@ def main():
                 preprocess_function,
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
-                remove_columns=test_column_names,
+                remove_columns=column_names,
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on prediction dataset",
             )
@@ -648,7 +653,7 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
     )
-    
+
     # Training
     if training_args.do_train:
         checkpoint = None
@@ -679,23 +684,32 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-    
+
     if training_args.do_predict:
         logger.info("*** Predict ***")
 
         predict_results = trainer.predict(predict_dataset, metric_key_prefix="predict")
-        #print(predict_results)
-        #metrics = predict_results.metrics
+        metrics = predict_results.metrics
         max_predict_samples = (
             data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
-     )
+        )
         metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
 
-        #trainer.log_metrics("predict", metrics)
-        #trainer.save_metrics("predict", metrics)
+        trainer.log_metrics("predict", metrics)
+        trainer.save_metrics("predict", metrics)
 
         if trainer.is_world_process_zero():
             if training_args.predict_with_generate:
+                '''output ground truth'''
+                ground_truth = predict_results.label_ids
+                ground_truth = np.where(ground_truth != -100, ground_truth, tokenizer.pad_token_id)
+                ground_truth = tokenizer.batch_decode(
+                    ground_truth, skip_special_tokens=True, clean_up_tokenization_spaces=True
+                )
+                ground_truth = [pred.strip() for pred in ground_truth]
+                output_prediction_file = os.path.join(training_args.output_dir, "ground_truth.txt")
+                with open(output_prediction_file, "w") as writer:
+                    writer.write("\n".join(ground_truth))
                 '''output generated predictions'''
                 predictions = predict_results.predictions
                 predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
@@ -706,7 +720,26 @@ def main():
                 output_prediction_file = os.path.join(training_args.output_dir, "generated_captions.txt")
                 with open(output_prediction_file, "w") as writer:
                     writer.write("\n".join(predictions))
-    
+
+    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "summarization"}
+    if data_args.dataset_name is not None:
+        kwargs["dataset_tags"] = data_args.dataset_name
+        if data_args.dataset_config_name is not None:
+            kwargs["dataset_args"] = data_args.dataset_config_name
+            kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
+        else:
+            kwargs["dataset"] = data_args.dataset_name
+
+    if data_args.lang is not None:
+        kwargs["language"] = data_args.lang
+
+    if training_args.push_to_hub:
+        trainer.push_to_hub(**kwargs)
+    else:
+        trainer.create_model_card(**kwargs)
+
+    return results
+
 
 def _mp_fn(index):
     # For xla_spawn (TPUs)
