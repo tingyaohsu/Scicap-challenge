@@ -1,6 +1,6 @@
 accelerate
 charset-normalizer
-datasets
+datasets==2.10.1
 evaluate
 nltk
 pandas
